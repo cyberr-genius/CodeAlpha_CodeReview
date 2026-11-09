@@ -1,0 +1,219 @@
+"""
+NotesApp - SECURE version.
+
+
+Run  for local testing:
+    export SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+    export COOKIE_SECURE=0        # only because local testing has no HTTPS
+    python secure_app.py
+"""
+import ipaddress
+import os
+import sqlite3
+import subprocess
+import uuid
+from functools import wraps
+
+from flask import (Flask, Response, abort, request, session,
+                   render_template_string, send_from_directory)
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_wtf.csrf import CSRFProtect, generate_csrf
+from itsdangerous import BadSignature, URLSafeSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+
+app.config["SECRET_KEY"] = os.environ["SECRET_KEY"]
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1") == "1",
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=1800,
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+)
+
+csrf = CSRFProtect(app)                                   
+limiter = Limiter(get_remote_address, app=app)            
+profile_signer = URLSafeSerializer(app.config["SECRET_KEY"], salt="profile")
+
+DB_FILE = os.environ.get("DB_FILE", "notes.db")
+UPLOAD_DIR = os.path.abspath("uploads")
+ALLOWED_EXTENSIONS = {"png", "jpg", "pdf"}
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers["Content-Security-Policy"] = "default-src 'self'"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    return resp
+
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    db = get_db()
+    db.execute("CREATE TABLE IF NOT EXISTS users ("
+               "id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS notes ("
+               "id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, title TEXT, body TEXT)")
+    db.commit()
+    db.close()
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if "user_id" not in session:
+            abort(401)
+        return view(*args, **kwargs)
+    return wrapped
+
+
+@app.route("/csrf-token")
+def csrf_token():
+    """Lets API clients/curl fetch a token to send as the X-CSRFToken header."""
+    return {"csrf_token": generate_csrf()}
+
+
+@app.route("/register", methods=["POST"])
+def register():
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+    if not username or len(password) < 12:                
+        abort(400, "Username required and password must be at least 12 characters")
+    db = get_db()
+    try:
+        db.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",      
+                   (username, generate_password_hash(password, method="scrypt")))    
+        db.commit()
+    except sqlite3.IntegrityError:
+        abort(409, "Username unavailable")
+    return "Registered"
+
+
+@app.route("/login", methods=["POST"])
+@limiter.limit("5 per minute")                            
+def login():
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    user = get_db().execute(                               
+        "SELECT id, password_hash FROM users WHERE username = ?", (username,)).fetchone()
+    if user and check_password_hash(user["password_hash"], password):
+        session.clear()
+        session["user_id"] = user["id"]
+        session.permanent = True
+        app.logger.info("Login success user_id=%s ip=%s", user["id"], request.remote_addr)  # [FIX 14]
+        return "Logged in"
+    app.logger.warning("Login failure ip=%s", request.remote_addr)  
+    return "Invalid username or password", 401             
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return "Logged out"
+
+
+@app.route("/note", methods=["POST"])
+@login_required
+def create_note():
+    db = get_db()
+    db.execute("INSERT INTO notes (owner_id, title, body) VALUES (?, ?, ?)",
+               (session["user_id"], request.form.get("title", ""), request.form.get("body", "")))
+    db.commit()
+    return "Note created"
+
+
+@app.route("/note/<int:note_id>")
+@login_required
+def get_note(note_id):
+    note = get_db().execute(                                
+        "SELECT id, title, body FROM notes WHERE id = ? AND owner_id = ?",
+        (note_id, session["user_id"])).fetchone()
+    if note is None:
+        abort(404)
+    return dict(note)
+
+
+@app.route("/search")
+@login_required
+def search():
+    q = request.args.get("q", "")
+    rows = get_db().execute(                                
+        "SELECT id, title FROM notes WHERE owner_id = ? AND title LIKE ?",
+        (session["user_id"], f"%{q}%")).fetchall()
+    return {"results": [dict(r) for r in rows]}
+
+
+@app.route("/greet")
+def greet():
+    name = request.args.get("name", "")
+    return render_template_string("<h1>Hello {{ name }}</h1>", name=name)
+
+
+@app.route("/ping")
+@login_required
+def ping():
+    try:                                                    
+        host = str(ipaddress.ip_address(request.args.get("host", "")))
+    except ValueError:
+        abort(400, "Invalid IP address")
+    result = subprocess.run(["ping", "-c", "1", host],      
+                            capture_output=True, text=True, timeout=5, shell=False)
+    return Response(result.stdout, mimetype="text/plain")
+
+
+@app.route("/upload", methods=["POST"])
+@login_required
+def upload():
+    f = request.files.get("file")
+    if f is None or not f.filename:
+        abort(400, "No file")
+    name = secure_filename(f.filename)
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in ALLOWED_EXTENSIONS:                       
+        abort(400, "File type not allowed")
+    stored = f"{uuid.uuid4().hex}.{ext}"                    
+    f.save(os.path.join(UPLOAD_DIR, stored))
+    return {"stored_as": stored}
+
+
+@app.route("/download")
+@login_required
+def download():
+    filename = secure_filename(request.args.get("file", ""))  
+    if not filename:
+        abort(400)
+    return send_from_directory(UPLOAD_DIR, filename, as_attachment=True)  
+
+
+@app.route("/set_profile")
+def set_profile():
+    token = profile_signer.dumps({"name": request.args.get("name", "guest")})   
+    resp = app.make_response("Profile cookie set")
+    resp.set_cookie("profile", token, httponly=True,
+                    secure=app.config["SESSION_COOKIE_SECURE"], samesite="Lax")
+    return resp
+
+
+@app.route("/load_profile")
+def load_profile():
+    try:                                                    
+        profile = profile_signer.loads(request.cookies.get("profile", ""))
+    except BadSignature:
+        abort(400, "Invalid profile cookie")
+    return {"profile": profile}
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(host="127.0.0.1", port=5000, debug=False)
