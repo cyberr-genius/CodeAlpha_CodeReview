@@ -1,0 +1,122 @@
+#NotesApp -  VULNERABLE training application.
+
+#WARNING: Do NOT deploy this. 
+import base64
+import hashlib
+import os
+import pickle
+import sqlite3
+
+from flask import Flask, request, session, send_file, render_template_string
+
+app = Flask(__name__)
+app.secret_key = "supersecret123"          
+DB_PASSWORD = "admin@123"                  
+DB_FILE = "notes.db"
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    db = get_db()
+    db.execute("CREATE TABLE IF NOT EXISTS users ("
+               "id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)")
+    db.execute("CREATE TABLE IF NOT EXISTS notes ("
+               "id INTEGER PRIMARY KEY, owner_id INTEGER, title TEXT, body TEXT)")
+    db.commit()
+    db.close()
+
+
+@app.route("/register", methods=["POST"])
+def register():
+    username = request.form["username"]
+    password = hashlib.md5(request.form["password"].encode()).hexdigest()  
+    db = get_db()
+    db.execute(f"INSERT INTO users (username, password) VALUES ('{username}', '{password}')")  
+    db.commit()
+    return "Registered"
+
+
+@app.route("/login", methods=["POST"])
+def login():                                
+    username = request.form["username"]
+    password = hashlib.md5(request.form["password"].encode()).hexdigest()  
+    app.logger.info(f"Login attempt: {username} / {request.form['password']}")  
+    query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"  
+    user = get_db().execute(query).fetchone()
+    if user:
+        session["user_id"] = user["id"]
+        return "Logged in"
+    return "Wrong username or wrong password", 401
+
+
+@app.route("/note", methods=["POST"])
+def create_note():
+    db = get_db()
+    db.execute("INSERT INTO notes (owner_id, title, body) VALUES (?, ?, ?)",
+               (session.get("user_id"), request.form["title"], request.form["body"]))
+    db.commit()
+    return "Note created"
+
+
+@app.route("/note/<int:note_id>")
+def get_note(note_id):
+    note = get_db().execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+    return dict(note) if note else ("Not found", 404)
+
+
+@app.route("/search")
+def search():
+    q = request.args.get("q", "")
+    rows = get_db().execute(f"SELECT * FROM notes WHERE title LIKE '%{q}%'").fetchall()  
+    return {"results": [dict(r) for r in rows]}
+
+
+@app.route("/greet")
+def greet():
+    name = request.args.get("name", "")
+    return render_template_string("<h1>Hello " + name + "</h1>")  
+
+@app.route("/ping")
+def ping():
+    host = request.args.get("host", "")
+    return os.popen("ping -c 1 " + host).read()  
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    f = request.files["file"]
+    f.save(os.path.join(UPLOAD_DIR, f.filename))  
+    return "Uploaded " + f.filename
+
+
+@app.route("/download")
+def download():
+    filename = request.args.get("file", "")
+    return send_file(UPLOAD_DIR + "/" + filename)  
+
+
+@app.route("/set_profile")
+def set_profile():
+    data = base64.b64encode(pickle.dumps({"name": request.args.get("name", "guest")}))
+    resp = app.make_response("Profile cookie set")
+    resp.set_cookie("profile", data.decode())  
+    return resp
+
+
+@app.route("/load_profile")
+def load_profile():
+    raw = request.cookies.get("profile", "")
+    profile = pickle.loads(base64.b64decode(raw))  
+    return {"profile": profile}
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", debug=True)  
